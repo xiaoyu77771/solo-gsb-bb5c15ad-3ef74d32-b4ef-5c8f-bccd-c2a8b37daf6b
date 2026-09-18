@@ -5,9 +5,9 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 # PEP 503 允许的发行包名：字母数字点/连字符/下划线，首尾为字母或数字
 # （单字符包名也合法）。
@@ -65,7 +65,8 @@ class CandidateMetadataIn(BaseModel):
     """候选版本随快照携带的 SBOM 元数据；三项全部可选。
 
     字段缺失或为空字符串表示“未提供”（/sbom 导出时只形成 warnings，
-    不阻断）；提供非空值时由 repository 层做格式校验（非法返回 422）。
+    /license-policy 判定时归入 unknowns，均不阻断）；提供非空值时由
+    repository 层做格式校验（非法返回 422）。
     """
 
     model_config = {"extra": "forbid"}
@@ -80,7 +81,10 @@ class CandidateMetadataIn(BaseModel):
     )
     license: str | None = Field(
         None,
-        description="该版本声明的许可证（SPDX 标识或许可证文本）；未提供时为 null。",
+        description=(
+            "该版本声明的许可证（/license-policy 按 SPDX AND/OR/括号表达式解析）；"
+            "未提供时为 null。"
+        ),
     )
 
 
@@ -98,7 +102,7 @@ class CandidateIn(BaseModel):
         None,
         description=(
             "该版本的可选 SBOM 元数据（source_url / sha256 / license）；"
-            "仅 POST /sbom 使用，缺字段不阻断其他端点。"
+            "仅 POST /sbom 与 POST /license-policy 使用，缺字段不阻断其他端点。"
         ),
     )
 
@@ -244,6 +248,38 @@ class SbomRequest(AuditLockRequest):
     """
 
     model_config = {"extra": "forbid"}
+
+
+# SPDX 许可证标识（allow/deny 集合元素）：去首尾空白后非空；
+# 与表达式中的标识符精确匹配（大小写敏感）。
+LicenseIdentifier = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1)
+]
+
+
+class LicensePolicyRequest(AuditLockRequest):
+    """POST /license-policy 的请求体：/audit-lock 字段 + allow/deny 标识集合。
+
+    先按 /audit-lock 的同一套规则校验 current_lock；锁有效时解析可达包
+    metadata.license 的 SPDX AND/OR/括号表达式，并按 allow/deny 做三态
+    判定。两个集合都按“集合”语义使用（重复元素等价于一个）；同一标识
+    同时出现在两侧时返回 422（规则重叠）。
+    """
+
+    model_config = {"extra": "forbid"}
+
+    allow: list[LicenseIdentifier] = Field(
+        default_factory=list,
+        description=(
+            "明确允许的 SPDX 许可证标识集合；表达式标识符精确匹配（大小写敏感）。"
+        ),
+    )
+    deny: list[LicenseIdentifier] = Field(
+        default_factory=list,
+        description=(
+            "明确拒绝的 SPDX 许可证标识集合；与 allow 重叠时返回 422。"
+        ),
+    )
 
 
 # --------------------------------------------------------------------- #
@@ -624,3 +660,69 @@ class SbomResponse(BaseModel):
             "不阻断导出。"
         ),
     )
+
+
+# --------------------------------------------------------------------- #
+# POST /license-policy 响应
+# --------------------------------------------------------------------- #
+class LicensePolicyItemOut(BaseModel):
+    """一个许可证判定为拒绝/未知的包及其从根包出发的全部最短路径。"""
+
+    model_config = {"extra": "forbid"}
+
+    name: str = Field(..., description="PEP 503 规范化包名。")
+    license: str | None = Field(
+        ...,
+        description=(
+            "锁定版本携带的许可证文本（SPDX 表达式）；未提供元数据时为 null"
+            "（此时判定恒为未知）。"
+        ),
+    )
+    paths: list[list[str]] = Field(
+        ...,
+        description=(
+            "根包到该包的所有最短包路径（每条为规范化包名序列，含首尾）；"
+            "菱形依赖的等长路径全部保留；路径整体按字典序确定性排序。"
+        ),
+    )
+
+
+class LicensePolicyResponse(BaseModel):
+    """锁有效时的许可证策略检查结果。"""
+
+    model_config = {"extra": "forbid"}
+
+    status: Literal["ok"]
+    root: str = Field(..., description="规范化根包名。")
+    violations: list[LicensePolicyItemOut] = Field(
+        ...,
+        description=(
+            "许可证表达式判定为拒绝的包，按规范化包名排序；"
+            "AND 任一拒绝即违规、OR 全部拒绝才违规。"
+        ),
+    )
+    unknowns: list[LicensePolicyItemOut] = Field(
+        ...,
+        description=(
+            "许可证无法判定为允许/拒绝的包（含未提供许可证元数据的包），"
+            "按规范化包名排序。"
+        ),
+    )
+
+
+class InvalidPolicyResponse(BaseModel):
+    """allow 与 deny 存在重叠标识：422，不执行任何判定。"""
+
+    model_config = {"extra": "forbid"}
+
+    status: Literal["invalid_policy"]
+    message: str
+
+
+class InvalidLicenseResponse(BaseModel):
+    """可达包的许可证文本不是合法的 SPDX 表达式：422。"""
+
+    model_config = {"extra": "forbid"}
+
+    status: Literal["invalid_license"]
+    message: str

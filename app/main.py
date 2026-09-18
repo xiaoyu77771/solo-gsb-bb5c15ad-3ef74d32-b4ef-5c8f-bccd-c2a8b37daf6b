@@ -21,6 +21,13 @@
   有效则沿已激活依赖图生成确定性 JSON 清单：每包含规范化名称、版本、
   PURL、依赖名称与候选版本携带的 source_url/sha256/license 元数据；
   缺失元数据只形成 warnings，不阻断导出；结果按包名排序
+* POST /license-policy
+  先按 /audit-lock 规则校验 current_lock；无效返回 409 审计问题，
+  有效则解析可达包 metadata.license 的 SPDX AND/OR/括号表达式，
+  按请求的 allow/deny 标识集合做三态判定（deny 拒绝、仅 allow 允许、
+  其余未知；AND 任一拒绝即违规、OR 任一允许即通过），返回按包名排序的
+  violations/unknowns，每项附根包到该包的全部最短路径；
+  非法 SPDX 或 allow/deny 重叠返回 422
 * GET  /healthz     健康检查
 """
 
@@ -31,6 +38,7 @@ from fastapi.responses import JSONResponse
 from packaging.version import Version
 
 from .audit import audit_lock
+from .license_policy import LicenseExpressionError, evaluate_license_policy
 from .paths import build_locked_graph, shortest_paths
 from .repository import (
     SnapshotError,
@@ -46,8 +54,12 @@ from .schemas import (
     AuditLockResponse,
     DependencyPathsRequest,
     DependencyPathsResponse,
+    InvalidLicenseResponse,
     InvalidLockResponse,
+    InvalidPolicyResponse,
     InvalidSnapshotResponse,
+    LicensePolicyRequest,
+    LicensePolicyResponse,
     ResolveMatrixRequest,
     ResolveMatrixResponse,
     MatrixUnresolvedResponse,
@@ -67,7 +79,7 @@ app = FastAPI(
         "所有仓库数据与目标环境随请求提交，本地解析，不访问任何远程索引、"
         "不读取宿主机平台信息。"
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -584,3 +596,102 @@ def sbom_endpoint(request: SbomRequest):
         graph=graph,
     )
     return {"status": "ok", "root": root_canonical, **document}
+
+
+@app.post(
+    "/license-policy",
+    summary="按 allow/deny 策略对锁定清单做 SPDX 许可证三态判定",
+    response_model=LicensePolicyResponse,
+    responses={
+        409: {"model": InvalidLockResponse, "description": "锁定清单未通过审计"},
+        422: {
+            "model": (
+                InvalidSnapshotResponse | InvalidPolicyResponse
+                | InvalidLicenseResponse
+            ),
+            "description": (
+                "快照、current_lock 或请求非法（invalid_snapshot）；"
+                "allow/deny 标识重叠（invalid_policy）；"
+                "可达包许可证不是合法的 SPDX 表达式（invalid_license）"
+            ),
+        },
+    },
+)
+def license_policy_endpoint(request: LicensePolicyRequest):
+    root_canonical = canonical(request.root)
+    payload = request.model_dump()
+
+    try:
+        repo = build_repository(payload["repository"], payload["target_environment"])
+        root_spec = parse_root_specifier(request.specifier)
+        current_lock = parse_current_lock(payload["current_lock"])
+    except SnapshotError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "invalid_snapshot", "message": str(exc)},
+        )
+
+    if not repo.known(root_canonical):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "invalid_snapshot",
+                "message": f"根包 {root_canonical!r} 不存在于仓库快照中",
+            },
+        )
+
+    # 先按现有审计规则校验锁定清单；无效则带确定性排序的问题返回 409，
+    # 不执行任何许可证判定。
+    result = audit_lock(
+        repo,
+        root_name=root_canonical,
+        root_spec=root_spec,
+        root_raw=request.specifier,
+        current_lock=current_lock,
+        allow_prereleases=request.allow_prereleases,
+    )
+    if not result["valid"]:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "status": "invalid_lock",
+                "message": "锁定清单未通过审计，未执行许可证策略检查",
+                "issues": result["issues"],
+            },
+        )
+
+    # 规则重叠：同一标识同时出现在 allow 与 deny 中，无法判定，返回 422。
+    allow = frozenset(request.allow)
+    deny = frozenset(request.deny)
+    overlap = sorted(allow & deny)
+    if overlap:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "invalid_policy",
+                "message": (
+                    "allow 与 deny 存在重叠的许可证标识："
+                    f"{'、'.join(overlap)}；同一标识只能属于其中一侧"
+                ),
+            },
+        )
+
+    # 有效锁：按锁定版本与目标环境激活的依赖建图（无版本选择），再逐包判定。
+    graph = build_locked_graph(
+        repo, root_name=root_canonical, current_lock=current_lock
+    )
+    try:
+        report = evaluate_license_policy(
+            repo,
+            root_name=root_canonical,
+            current_lock=current_lock,
+            graph=graph,
+            allow=allow,
+            deny=deny,
+        )
+    except LicenseExpressionError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "invalid_license", "message": str(exc)},
+        )
+    return {"status": "ok", "root": root_canonical, **report}
