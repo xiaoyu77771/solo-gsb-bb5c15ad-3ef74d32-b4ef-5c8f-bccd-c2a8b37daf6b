@@ -246,6 +246,33 @@ class SbomRequest(AuditLockRequest):
     model_config = {"extra": "forbid"}
 
 
+class LicensePolicyRequest(AuditLockRequest):
+    """POST /license-policy 的请求体：在 /audit-lock 字段上附加 allow/deny。
+
+    先按 /audit-lock 的同一套规则校验 current_lock；锁有效时解析各可达包
+    锁定版本 metadata.license 的 SPDX AND/OR/括号表达式，按 allow/deny
+    两个标识集合做三态判定。两个集合均为单个 SPDX 标识词（不接受
+    AND/OR 表达式），同一标识不得同时出现在两个集合中（规则重叠返回 422）。
+    """
+
+    model_config = {"extra": "forbid"}
+
+    allow: list[str] = Field(
+        default_factory=list,
+        description=(
+            "允许的 SPDX 许可证标识集合（单个标识词，大小写敏感），"
+            "如 [\"MIT\", \"Apache-2.0\"]；缺省为空列表。"
+        ),
+    )
+    deny: list[str] = Field(
+        default_factory=list,
+        description=(
+            "拒绝的 SPDX 许可证标识集合（单个标识词，大小写敏感），"
+            "如 [\"GPL-3.0-only\"]；缺省为空列表。不得与 allow 重叠。"
+        ),
+    )
+
+
 # --------------------------------------------------------------------- #
 # 响应模型
 # --------------------------------------------------------------------- #
@@ -622,5 +649,53 @@ class SbomResponse(BaseModel):
         description=(
             "元数据缺失提示，按包名排序；仅列出至少缺一个元数据字段的包，"
             "不阻断导出。"
+        ),
+    )
+
+
+# --------------------------------------------------------------------- #
+# POST /license-policy 响应
+# --------------------------------------------------------------------- #
+class LicensePolicyEntryOut(BaseModel):
+    """一个许可证策略命中包（违规或未知）。"""
+
+    model_config = {"extra": "forbid"}
+
+    name: str = Field(..., description="PEP 503 规范化包名。")
+    license: str | None = Field(
+        ...,
+        description=(
+            "该包锁定版本 metadata.license 的原始 SPDX 表达式文本；"
+            "未提供许可证（null/空串）时为 null（只可能出现在 unknowns 中）。"
+        ),
+    )
+    paths: list[list[str]] = Field(
+        ...,
+        description=(
+            "根包到该包的所有最短包路径（每条为规范化包名序列，含首尾）；"
+            "菱形依赖的等长路径全部保留；路径整体按字典序确定性排序。"
+        ),
+    )
+
+
+class LicensePolicyResponse(BaseModel):
+    """锁有效时的许可证策略判定结果。"""
+
+    model_config = {"extra": "forbid"}
+
+    status: Literal["ok"]
+    root: str = Field(..., description="规范化根包名。")
+    violations: list[LicensePolicyEntryOut] = Field(
+        ...,
+        description=(
+            "许可证表达式判定为拒绝的包，按规范化包名排序；"
+            "AND 中任一标识被 deny 即拒绝，OR 中全部标识被 deny 才拒绝。"
+        ),
+    )
+    unknowns: list[LicensePolicyEntryOut] = Field(
+        ...,
+        description=(
+            "许可证表达式判定为未知的包，按规范化包名排序；"
+            "既未拒绝也未全部/任一允许，或锁定版本未提供 metadata.license。"
         ),
     )

@@ -21,6 +21,12 @@
   有效则沿已激活依赖图生成确定性 JSON 清单：每包含规范化名称、版本、
   PURL、依赖名称与候选版本携带的 source_url/sha256/license 元数据；
   缺失元数据只形成 warnings，不阻断导出；结果按包名排序
+* POST /license-policy
+  先按 /audit-lock 规则校验 current_lock；无效返回 409 审计问题，
+  有效则解析各可达包锁定版本 metadata.license 的 SPDX AND/OR/括号
+  表达式，按请求的 allow/deny 标识集合做三态判定，返回按包名排序的
+  violations 与 unknowns（各附根包到该包的全部最短路径）；
+  非法 SPDX 表达式或 allow/deny 规则重叠返回 422
 * GET  /healthz     健康检查
 """
 
@@ -31,6 +37,7 @@ from fastapi.responses import JSONResponse
 from packaging.version import Version
 
 from .audit import audit_lock
+from .license_policy import evaluate_license_policy
 from .paths import build_locked_graph, shortest_paths
 from .repository import (
     SnapshotError,
@@ -48,6 +55,8 @@ from .schemas import (
     DependencyPathsResponse,
     InvalidLockResponse,
     InvalidSnapshotResponse,
+    LicensePolicyRequest,
+    LicensePolicyResponse,
     ResolveMatrixRequest,
     ResolveMatrixResponse,
     MatrixUnresolvedResponse,
@@ -59,6 +68,7 @@ from .schemas import (
     UpgradeRequest,
     UpgradeResponse,
 )
+from .spdx import LicenseExpressionError, parse_policy_sets
 
 app = FastAPI(
     title="本地依赖解析 API",
@@ -67,7 +77,7 @@ app = FastAPI(
         "所有仓库数据与目标环境随请求提交，本地解析，不访问任何远程索引、"
         "不读取宿主机平台信息。"
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -583,4 +593,83 @@ def sbom_endpoint(request: SbomRequest):
         current_lock=current_lock,
         graph=graph,
     )
+    return {"status": "ok", "root": root_canonical, **document}
+
+
+@app.post(
+    "/license-policy",
+    summary="在有效锁定清单上按 allow/deny 判定各可达包的 SPDX 许可证表达式",
+    response_model=LicensePolicyResponse,
+    responses={
+        409: {"model": InvalidLockResponse, "description": "锁定清单未通过审计"},
+        422: {
+            "model": InvalidSnapshotResponse,
+            "description": "快照/current_lock 非法、SPDX 表达式非法或 allow/deny 规则重叠",
+        },
+    },
+)
+def license_policy_endpoint(request: LicensePolicyRequest):
+    root_canonical = canonical(request.root)
+    payload = request.model_dump()
+
+    try:
+        repo = build_repository(payload["repository"], payload["target_environment"])
+        root_spec = parse_root_specifier(request.specifier)
+        current_lock = parse_current_lock(payload["current_lock"])
+    except SnapshotError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "invalid_snapshot", "message": str(exc)},
+        )
+
+    if not repo.known(root_canonical):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "invalid_snapshot",
+                "message": f"根包 {root_canonical!r} 不存在于仓库快照中",
+            },
+        )
+
+    # 先按现有审计规则校验锁定清单；无效则带确定性排序的问题返回 409，
+    # 不解析任何许可证表达式。
+    result = audit_lock(
+        repo,
+        root_name=root_canonical,
+        root_spec=root_spec,
+        root_raw=request.specifier,
+        current_lock=current_lock,
+        allow_prereleases=request.allow_prereleases,
+    )
+    if not result["valid"]:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "status": "invalid_lock",
+                "message": "锁定清单未通过审计，未执行许可证策略判定",
+                "issues": result["issues"],
+            },
+        )
+
+    # 规则集合（标识合法性、allow/deny 重叠）与许可证表达式均属于请求
+    # 语义校验：非法返回 422，输出不做任何判定。
+    try:
+        allow_set, deny_set = parse_policy_sets(request.allow, request.deny)
+        graph = build_locked_graph(
+            repo, root_name=root_canonical, current_lock=current_lock
+        )
+        document = evaluate_license_policy(
+            repo,
+            root_name=root_canonical,
+            current_lock=current_lock,
+            graph=graph,
+            allow=allow_set,
+            deny=deny_set,
+        )
+    except (SnapshotError, LicenseExpressionError) as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "invalid_snapshot", "message": str(exc)},
+        )
+
     return {"status": "ok", "root": root_canonical, **document}

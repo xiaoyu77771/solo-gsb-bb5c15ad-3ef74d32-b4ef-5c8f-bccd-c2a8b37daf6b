@@ -19,6 +19,11 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 **确定性 JSON 物料清单（SBOM）**：每个包给出规范化名称、版本、PURL
 （Package URL）、依赖名称及候选版本随快照携带的 `source_url` / `sha256`
 / `license` 元数据；元数据缺失只形成 `warnings`，不阻断导出。
+`/license-policy` 也**先审计 `current_lock`**，锁有效时解析各可达包锁定
+版本 `metadata.license` 的 **SPDX `AND`/`OR`/括号表达式**，按请求的
+`allow` / `deny` 标识集合做**三态判定**（允许 / 拒绝 / 未知），返回按包名
+排序的 `violations` 与 `unknowns`，每项附根包到该包的**全部最短路径**；
+非法 SPDX 表达式或 allow/deny 规则重叠返回 422。
 
 - **无远程访问**：不访问 PyPI 或任何索引，不做磁盘缓存，全部数据在请求内存中处理。
 - **目标环境随请求给定**：每条依赖可携带 PEP 508 marker，由请求必填的
@@ -52,6 +57,7 @@ docker compose up --build
 | 审计接口 | `POST http://localhost:8000/audit-lock` |
 | 依赖路径接口 | `POST http://localhost:8000/dependency-paths` |
 | SBOM 导出接口 | `POST http://localhost:8000/sbom` |
+| 许可证策略接口 | `POST http://localhost:8000/license-policy` |
 | 健康检查 | `GET  http://localhost:8000/healthz` |
 | 交互文档（Swagger） | `http://localhost:8000/docs` |
 | OpenAPI Schema | `http://localhost:8000/openapi.json` |
@@ -835,6 +841,119 @@ curl -s -X POST http://localhost:8000/sbom \
 | `409` | 锁定清单未通过审计：`status: "invalid_lock"`，`issues` 与 `/audit-lock` 的输出一致（确定性排序），不导出清单 |
 | `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 含非法 PEP 440 版本、同一规范化包名对应多个不同版本、候选 `metadata.sha256` 不是 64 位十六进制、`metadata.source_url` 不是 `http`/`https` 绝对 URL |
 
+### `POST /license-policy`
+
+在**审计通过的锁定清单**上按调用方给定的 allow/deny 策略判定每个可达包的
+许可证。请求体沿用 `/audit-lock` 的全部字段（`/resolve` 字段 +
+`current_lock`，语义完全一致），并附加两个策略字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `allow` | `string[]` | 否 | **允许**的 SPDX 许可证标识集合，缺省为 `[]`；每项必须是**单个标识词**（不接受 `AND`/`OR`/括号表达式），如 `"MIT"`、`"Apache-2.0"`、`"GPL-2.0+"`、`"LicenseRef-Proprietary"`；标识**大小写敏感、按字面匹配** |
+| `deny` | `string[]` | 否 | **拒绝**的 SPDX 许可证标识集合，格式同 `allow`，缺省为 `[]`；与 `allow` **不得重叠**（同一标识同时出现属于规则冲突，返回 422） |
+
+处理流程：
+
+1. **先按 `/audit-lock` 的同一套规则校验 `current_lock`**（含目标环境的
+   marker 激活语义）。锁无效时返回 **409**，携带与 `/audit-lock`
+   逐字节一致、确定性排序的 `issues`，**不解析任何许可证表达式**
+   （响应中没有 `violations` / `unknowns` 字段）；
+2. 锁有效时**不做任何版本选择**：在与 `/dependency-paths`、`/sbom`
+   **同一张已激活依赖图**上（按锁定版本、marker 求值后激活的依赖），
+   逐包读取其**锁定版本**候选的 `metadata.license`：
+   - 未提供（`null` / 空串）：整包判为**未知**（归入 `unknowns`，
+     `license` 输出 `null`），不阻断请求；
+   - 提供文本：先按 **SPDX 表达式**解析（`AND` / `OR` / 括号，
+     `OR` 优先级最低、`AND` 更高；`AND`/`OR` 大小写不敏感，标识词
+     大小写敏感），再按三态规则求值；
+   - 许可证文本不是合法的 SPDX 表达式（含不支持的 `WITH` 例外表达式）
+     时返回 **422**，错误信息定位到包与版本；
+3. 每个包的判定结果为**三态**之一：
+
+   | 原子标识 / 表达式 | 结果 |
+   | --- | --- |
+   | 标识在 `deny` 中 | 拒绝 |
+   | 标识仅在 `allow` 中 | 允许 |
+   | 标识不在两者中 | 未知 |
+   | `A AND B` | **全部允许才允许；任一拒绝即拒绝；其余未知** |
+   | `A OR B` | **任一允许即允许；全部拒绝才拒绝；其余未知** |
+
+   例如 `MIT AND GPL-3.0-only`（GPL 在 deny 中）→ 拒绝；
+   `MIT OR GPL-3.0-only`（MIT 在 allow 中）→ 允许；
+   `MIT AND Custom-Internal`（`Custom-Internal` 两集合都没有）→ 未知；
+   `GPL-3.0-only OR Custom-Internal`（一拒绝一未知）→ 未知。
+
+响应字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `status` | 固定 `"ok"` |
+| `root` | 规范化（PEP 503）后的根包名 |
+| `violations` | 判定为**拒绝**的包列表，**按规范化包名排序**；允许的包不出现 |
+| `unknowns` | 判定为**未知**的包列表（含未提供许可证的包），**按规范化包名排序** |
+| `violations[]` / `unknowns[]` | 每项为 `{"name", "license", "paths"}`：`name` 为规范化包名；`license` 为该包锁定版本的原始 SPDX 表达式文本（未提供时为 `null`）；`paths` 为根包到该包的**全部最短包路径**（与 `/dependency-paths` 同语义：含首尾、菱形等长路径全保留、环安全、字典序确定性排序；根包自身为单节点路径 `[root]`） |
+
+```bash
+curl -s -X POST http://localhost:8000/license-policy \
+  -H 'Content-Type: application/json' \
+  -d @examples/license-policy.json
+```
+
+示例中策略允许 `Apache-2.0` / `BSD-3-Clause` / `MIT`、拒绝
+`GPL-3.0-only` / `AGPL-3.0-only`：`copyleft-lib 1.0` 声明 `GPL-3.0-only`
+构成违规，且它同时被 `web-framework → shared-util 1.5.0` 与
+`auth-lib → shared-util 1.5.0` 两条等长菱形路径引入（两条最短路径都
+返回）；`json-tool` 的 `JSON OR MIT` 因含允许的 `MIT` 而整体允许；
+`internal-thing` 未声明许可证，归入未知：
+
+```json
+{
+  "status": "ok",
+  "root": "app",
+  "violations": [
+    {
+      "name": "copyleft-lib",
+      "license": "GPL-3.0-only",
+      "paths": [
+        ["app", "auth-lib", "shared-util", "copyleft-lib"],
+        ["app", "web-framework", "shared-util", "copyleft-lib"]
+      ]
+    }
+  ],
+  "unknowns": [
+    {
+      "name": "internal-thing",
+      "license": null,
+      "paths": [
+        ["app", "internal-thing"]
+      ]
+    }
+  ]
+}
+```
+
+确定性与遍历细节：
+
+- 许可证只读取**锁定版本**候选的 `metadata.license`；同一包未被锁定的
+  其他版本携带的许可证不参与判定，也不会合并。
+- 判定与路径都只覆盖**已激活依赖图**中的包（含根包）：换一个
+  `target_environment`，激活图变化，参与判定的包随之变化（在新环境下
+  若锁审计失败则返回 409）；未激活 marker 依赖即使声明了被拒绝的
+  许可证也不会出现。
+- 标识按字面、大小写敏感匹配：`mit` 不匹配策略中的 `MIT`（归为未知）；
+  尾随 `+` 的 "or later" 标识（如 `Apache-2.0+`）是标识的一部分，需在
+  策略中按完整字面列出才会命中。
+- 输出只取决于快照、目标环境、锁定清单与 allow/deny 集合：两个列表按
+  包名排序、路径按字典序排序，重复请求逐字节一致。
+
+`/license-policy` 的状态码：
+
+| 状态码 | 含义 |
+| --- | --- |
+| `200` | 锁有效，策略判定完成（存在违规或未知项仍是 200；`violations` / `unknowns` 同时为空表示全部允许） |
+| `409` | 锁定清单未通过审计：`status: "invalid_lock"`，`issues` 与 `/audit-lock` 的输出一致（确定性排序），不解析许可证、不做判定 |
+| `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 含非法 PEP 440 版本、某可达包锁定版本的 `metadata.license` 不是合法 SPDX `AND`/`OR`/括号表达式（含 `WITH`）、`allow`/`deny` 项不是单个合法 SPDX 标识、`allow` 与 `deny` 存在重叠标识 |
+
 ---
 
 ## 三、解析规则说明
@@ -881,6 +1000,16 @@ curl -s -X POST http://localhost:8000/sbom \
     依赖名称（去重排序）与候选版本携带的 `source_url` / `sha256` /
     `license` 元数据；元数据缺失不阻断导出，只在 `warnings` 中按包名逐项
     提示；`packages` 按包名排序，输出只取决于快照、环境与锁。
+14. **许可证策略（`/license-policy`）**：先复用第 10 条的审计，锁无效即
+    返回 409 且不判定；锁有效时在第 11 条的已激活依赖图上逐包读取锁定
+    版本的 `metadata.license`：未提供归为未知（不阻断），提供则解析
+    SPDX `AND`/`OR`/括号表达式（`OR` 低于 `AND`，括号分组；关键字大小
+    写不敏感、标识大小写敏感），按 allow/deny 两个标识集合做三态求值——
+    标识在 deny 中为拒绝、仅在 allow 中为允许、其余未知；`AND` 全部允许
+    才通过、任一拒绝即违规；`OR` 任一允许即通过、全部拒绝才违规、其余
+    未知。`violations` 与 `unknowns` 各自按包名排序，每项复用
+    第 11 条的最短路径算法附根包到该包的全部最短路径；非法 SPDX 表达式
+    （含 `WITH`）、allow/deny 非法标识或两集合重叠返回 422，输出确定。
 
 ### 安全护栏
 
@@ -892,16 +1021,18 @@ curl -s -X POST http://localhost:8000/sbom \
 
 ```
 app/
-  main.py        # FastAPI 路由与错误映射
-  resolver.py    # 回溯求解器（候选排序 / MRV / 来源链重建）
-  audit.py       # 锁定清单审计（按锁版本遍历 / 环中累计入边 / 四类问题）
-  paths.py       # 锁定依赖图建图与根包到目标包的全部最短路径（菱形/环安全）
-  sbom.py        # 沿已激活依赖图导出确定性 JSON SBOM（PURL / 元数据 / 缺失 warnings）
-  repository.py  # 快照规范化、PEP 440/503 解析、按环境过滤 marker、候选元数据校验
-  markers.py     # PEP 508 marker 解析/白名单校验/环境求值（不读宿主机）
-  schemas.py     # 请求/响应模型
-examples/        # curl 示例请求体（含跨环境 marker、/resolve-matrix、/upgrade、/audit-lock、/dependency-paths、/sbom 示例）
-tests/           # 求解器与 HTTP 层测试（pytest + FastAPI TestClient）
+  main.py           # FastAPI 路由与错误映射
+  resolver.py       # 回溯求解器（候选排序 / MRV / 来源链重建）
+  audit.py          # 锁定清单审计（按锁版本遍历 / 环中累计入边 / 四类问题）
+  paths.py          # 锁定依赖图建图与根包到目标包的全部最短路径（菱形/环安全）
+  sbom.py           # 沿已激活依赖图导出确定性 JSON SBOM（PURL / 元数据 / 缺失 warnings）
+  spdx.py           # SPDX 许可证表达式词法/递归下降解析与 allow/deny 三态求值
+  license_policy.py # 有效锁图上的逐包许可证策略判定（违规/未知 + 全部最短路径）
+  repository.py     # 快照规范化、PEP 440/503 解析、按环境过滤 marker、候选元数据校验
+  markers.py        # PEP 508 marker 解析/白名单校验/环境求值（不读宿主机）
+  schemas.py        # 请求/响应模型
+examples/            # curl 示例请求体（含跨环境 marker、/resolve-matrix、/upgrade、/audit-lock、/dependency-paths、/sbom、/license-policy 示例）
+tests/               # 求解器与 HTTP 层测试（pytest + FastAPI TestClient）
 Dockerfile
 docker-compose.yml
 requirements.txt
